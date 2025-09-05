@@ -6,6 +6,7 @@ import fetcher as ft
 from urllib.request import urlretrieve
 import logging
 from logging.handlers import RotatingFileHandler
+import sqlite3
 
 # --- Configuration du logging ---
 logging.addLevelName(logging.DEBUG, "DÉBOGAGE")
@@ -37,15 +38,83 @@ APP_KEY = os.environ["APP_KEY"]
 APP_SECRET = os.environ["APP_SECRET"]
 CONSUMER_KEY = os.environ["CONSUMER_KEY"]
 PATH_OVH = os.environ["OVH_PATH"]
+DB_PATH = os.environ["DB_PATH"]
 YEAR = datetime.now().year  # Année courante (int)
+
+
+def get_conn():
+    """
+    Ouvre une connexion SQLite vers DB_PATH, crée la table 'bills' si nécessaire, puis retourne la connexion.
+    """
+    try:
+        logger.debug("Ouverture de la connexion SQLite vers %s", DB_PATH)
+        conn = sqlite3.connect(DB_PATH)
+        logger.debug("Connexion établie, vérification/creation de la table 'bills'")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS bills (
+            bill_id TEXT PRIMARY KEY,
+            bill_year INT
+        )""")
+        conn.commit()
+        logger.info("Base SQLite initialisée et table 'bills' disponible")
+        return conn
+    except Exception as e:
+        logger.exception("Erreur lors de l'initialisation de la base SQLite: %s", e)
+        raise
+
+
+def add_entries_to_db(entries: list[tuple[str, int]], conn):
+    """
+    Insère en lot des paires (bill_id, bill_year) dans la table 'bills' avec gestion de conflit sur bill_id.
+    """
+    try:
+        logger.debug("Insertion batch dans 'bills': %d entrées", len(entries))
+        conn.executemany(
+            """
+            INSERT INTO bills (bill_id, bill_year)
+            VALUES (?, ?)
+            ON CONFLICT(bill_id) DO NOTHING
+            """,
+            entries,
+        )
+        conn.commit()
+        logger.info("Insertion batch dans 'bills' validée")
+    except Exception as e:
+        logger.exception("Échec d'insertion batch dans 'bills': %s", e)
+        raise
+
+
+def get_entries_from_db(conn) -> set[str]:
+    """
+    Récupère l'ensemble des bill_id présents dans la table 'bills' et les retourne sous forme de set[str].
+    """
+    try:
+        logger.debug("Sélection des bill_id depuis 'bills'")
+        cursor = conn.execute("SELECT bill_id FROM bills")
+        rows = cursor.fetchall()
+        logger.info("Sélection terminée: %d bill_id récupérés", len(rows))
+        return {row[0] for row in rows}
+    except Exception as e:
+        logger.exception("Échec de lecture des bill_id depuis 'bills': %s", e)
+        raise
+
+
+def compare_db_to_data(db_data: set[str], data: list[str]) -> list[str]:
+    """
+    Compare une collection d'identifiants 'data' à l'ensemble 'db_data' et retourne la liste des éléments absents de 'db_data'.
+    """
+    missings_current_year = list()
+    for bill_id in data:
+        if bill_id not in db_data:
+            missings_current_year.append(bill_id)
+    return missings_current_year
 
 
 def indexer(ids: list[str]) -> list[str]:
     """
-    Parcourt le répertoire de l'année courante et compare les factures déjà présentes
-    avec la liste d'IDs renvoyée par OVH. Ne conserve que les factures absentes
-    ET datées de l'année courante.
+    Parcourt le répertoire de l'année courante, filtre les factures déjà présentes localement, conserve les factures absentes datées de l'année courante, et enregistre en base celles qui appartiennent à une autre année.
     """
+    conn = get_conn()
     logger.info("Indexation des factures pour l'année %s", YEAR)
     target_dir = f"{PATH_OVH}{YEAR}"
     try:
@@ -54,10 +123,13 @@ def indexer(ids: list[str]) -> list[str]:
         logger.warning("Dossier %s inexistant, aucune facture locale", target_dir)
         ids_already_in = []
 
-    missing = [x for x in ids if f"{x}.pdf" not in ids_already_in]
+    missing = compare_db_to_data(
+        get_entries_from_db(conn), [x for x in ids if f"{x}.pdf" not in ids_already_in]
+    )
     logger.info("%d factures absentes détectées", len(missing))
 
     result: list[str] = []
+    not_valid_year: list[tuple[str, int]] = list()
     for bill_id in missing:
         try:
             meta = ft.fetch_invoice_content(
@@ -67,12 +139,16 @@ def indexer(ids: list[str]) -> list[str]:
                 consumer_key=CONSUMER_KEY,
             )
         except Exception as e:
-            logger.error("Impossible de récupérer la méta pour %s : %s", bill_id, e)
+            logger.error("Impossible de récupérer le json pour %s : %s", bill_id, e)
             continue
         bill_year = datetime.fromisoformat(meta["date"]).year
         if bill_year == YEAR:
             result.append(bill_id)
+        else:
+            not_valid_year.append((bill_id, bill_year))
 
+    add_entries_to_db(not_valid_year, conn)
+    logger.info(f"Ajouter {len(not_valid_year)} entrées a la base de donnée")
     logger.info("%d factures retenues pour téléchargement", len(result))
     return result
 
