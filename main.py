@@ -1,5 +1,6 @@
 import os
-from datetime import datetime
+import mail as ml
+from datetime import date, datetime, time
 import dotenv
 import ovh
 import fetcher as ft
@@ -39,6 +40,11 @@ APP_SECRET = os.environ["APP_SECRET"]
 CONSUMER_KEY = os.environ["CONSUMER_KEY"]
 PATH_OVH = os.environ["OVH_PATH"]
 DB_PATH = os.environ["DB_PATH"]
+EMAIL = os.environ["EMAIL"]
+EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+SMTP_MAIL_ADDRESS = os.environ["SMTP_MAIL_ADDRESS"]
+SMTP_PORT = os.environ["SMTP_PORT"]
+EMAIL_TO = os.environ["EMAIL_TO"]
 YEAR = datetime.now().year  # Année courante (int)
 
 
@@ -213,8 +219,29 @@ if __name__ == "__main__":
     os.makedirs(f"{PATH_OVH}{YEAR}", exist_ok=True)
 
     ids_candidats = indexer(get_ids())
-
+    bills_json = []
+    bills_str = []
     for bill_id in ids_candidats:
-        save_pdf(get_bill(bill_id))
+        bills_json.append((bill_id, get_bill(bill_id)))
+    # pdf enregistrement.
+    for bill_json in bills_json:
+        save_pdf(bill_json[1])
+        date = datetime.fromisoformat(bill_json[1]["date"]).date()
 
+        bills_str.append(
+            (
+                bill_json[0],
+                f"{date}",
+            )
+        )
+    content = ml.construct_html(bills_str)
+    ml.send_email(
+        "Reçu de facture(s)",
+        content,
+        email_from=EMAIL,
+        email_password=EMAIL_PASSWORD,
+        smpt_port=SMTP_PORT,
+        smtp_mail_address=SMTP_MAIL_ADDRESS,
+        email_to=EMAIL_TO,
+    )
     logger.info("Traitement terminé : %d factures téléchargées", len(ids_candidats))
